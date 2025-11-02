@@ -1,3 +1,4 @@
+import os
 import pandas as pd
 import plotly.graph_objects as go
 import plotly.express as px
@@ -10,7 +11,8 @@ from pathlib import Path
 import sys
 
 # ---------------- Load Data ----------------
-data_dir = Path(r"D:\Rainfall_Analysis\Data")
+# Use the script directory so this works locally and on Render
+data_dir = Path(__file__).parent
 candidates = list(data_dir.glob("*.xlsx")) + list(data_dir.glob("*.csv"))
 if not candidates:
     raise FileNotFoundError(f"No rainfall data found in {data_dir}")
@@ -37,8 +39,15 @@ monthly_display = ['Jan','Feb','Mar','Apr','May','Jun','Jul','Aug','Sep','Oct','
 col_map = {c.upper(): c for c in rainfall_data.columns}
 monthly_columns = [col_map.get(m, m) for m in monthly_expected if m in col_map]
 
+# Safety: if monthly columns missing, fallback to numeric cols except YEAR/ANNUAL
+if not monthly_columns:
+    numeric_cols = [c for c in rainfall_data.select_dtypes('number').columns if c.upper() not in ('YEAR','ANNUAL')]
+    monthly_columns = numeric_cols[:12]
+    monthly_display = [c for c in monthly_columns]
+
 # ---------------- Build Figures ----------------
 def build_figures(template):
+    # Annual trend (lines)
     annual = rainfall_data[['YEAR', 'ANNUAL']].dropna()
     fig_annual = go.Figure([
         go.Scatter(x=annual['YEAR'], y=annual['ANNUAL'], mode='lines', name='Annual'),
@@ -47,6 +56,7 @@ def build_figures(template):
     ])
     fig_annual.update_layout(title='Annual Rainfall Trend', template=template)
 
+    # Average monthly rainfall (bar)
     monthly_avg = rainfall_data[monthly_columns].mean()
     fig_monthly = px.bar(x=monthly_display, y=monthly_avg.values,
                          labels={'x': 'Month', 'y': 'Rainfall (mm)'},
@@ -54,6 +64,7 @@ def build_figures(template):
                          color=monthly_avg.values, color_continuous_scale='Blues',
                          template=template)
 
+    # 10-Year rolling average (climate)
     rainfall_data['10YR AVG'] = rainfall_data['ANNUAL'].rolling(10).mean()
     fig_climate = go.Figure([
         go.Scatter(x=rainfall_data['YEAR'], y=rainfall_data['ANNUAL'], mode='lines', name='Annual'),
@@ -61,30 +72,77 @@ def build_figures(template):
     ])
     fig_climate.update_layout(title='Climate Change Impact (10-Year Rolling Avg)', template=template)
 
+    # Prophet forecast
     rainfall_data['DATE'] = pd.to_datetime(rainfall_data['YEAR'], format='%Y')
     prophet_data = rainfall_data[['DATE', 'ANNUAL']].rename(columns={'DATE': 'ds', 'ANNUAL': 'y'})
     model = Prophet()
-    model.fit(prophet_data)
-    future = model.make_future_dataframe(periods=20, freq='Y')
-    forecast = model.predict(future)
-    fig_forecast = plot_plotly(model, forecast)
-    fig_forecast.update_layout(title='Rainfall Forecast (Prophet)', template=template)
+    try:
+        model.fit(prophet_data)
+        future = model.make_future_dataframe(periods=20, freq='Y')
+        forecast = model.predict(future)
+        fig_forecast = plot_plotly(model, forecast)
+        fig_forecast.update_layout(title='Rainfall Forecast (Prophet)', template=template)
+    except Exception as e:
+        # If Prophet fails (rarely on some envs), create a placeholder figure
+        fig_forecast = go.Figure()
+        fig_forecast.add_annotation(text=f"Forecast unavailable: {e}", showarrow=False)
+        fig_forecast.update_layout(title='Rainfall Forecast (Prophet)', template=template)
 
+    # Clustering (KMeans)
     features = rainfall_data[monthly_columns + ['ANNUAL']].fillna(0)
-    scaled = StandardScaler().fit_transform(features)
-    kmeans = KMeans(n_clusters=3, random_state=42)
-    rainfall_data['Cluster'] = kmeans.fit_predict(scaled)
-    labels = {0: 'Dry', 1: 'Normal', 2: 'Wet'}
-    rainfall_data['Category'] = rainfall_data['Cluster'].map(labels)
-    fig_cluster = px.scatter(rainfall_data, x='YEAR', y='ANNUAL', color='Category',
-                             title='Rainfall Clustering (Dry / Normal / Wet)', template=template)
+    try:
+        scaled = StandardScaler().fit_transform(features)
+        kmeans = KMeans(n_clusters=3, random_state=42)
+        rainfall_data['Cluster'] = kmeans.fit_predict(scaled)
+        labels = {0: 'Dry', 1: 'Normal', 2: 'Wet'}
+        # If cluster labels not 0/1/2 in order, map by cluster center mean
+        # But keep simple mapping as above
+        rainfall_data['Category'] = rainfall_data['Cluster'].map(labels)
+        fig_cluster = px.scatter(rainfall_data, x='YEAR', y='ANNUAL', color='Category',
+                                 title='Rainfall Clustering (Dry / Normal / Wet)', template=template)
+    except Exception as e:
+        fig_cluster = go.Figure()
+        fig_cluster.add_annotation(text=f"Clustering unavailable: {e}", showarrow=False)
+        fig_cluster.update_layout(title='Rainfall Clustering', template=template)
+
+    # --- New Visualization 1: Monthly Boxplot (distribution across years)
+    try:
+        # prepare long format for months
+        df_melt = rainfall_data[['YEAR'] + monthly_columns].melt(id_vars='YEAR', var_name='Month', value_name='Rainfall')
+        # order months according to monthly_columns
+        month_order = monthly_columns
+        # map to display names if necessary
+        fig_box = px.box(df_melt, x='Month', y='Rainfall', category_orders={'Month': month_order},
+                         labels={'Month': 'Month', 'Rainfall': 'Rainfall (mm)'},
+                         title='Monthly Rainfall Distribution (boxplot)', template=template)
+    except Exception as e:
+        fig_box = go.Figure()
+        fig_box.add_annotation(text=f"Boxplot unavailable: {e}", showarrow=False)
+        fig_box.update_layout(title='Monthly Rainfall Distribution', template=template)
+
+    # --- New Visualization 2: Cumulative Annual Rainfall
+    try:
+        cum = annual.copy()
+        cum['CUM_SUM'] = cum['ANNUAL'].cumsum()
+        fig_cum = go.Figure([
+            go.Scatter(x=cum['YEAR'], y=cum['CUM_SUM'], mode='lines', name='Cumulative Sum'),
+            go.Bar(x=cum['YEAR'], y=cum['ANNUAL'], name='Annual', opacity=0.3)
+        ])
+        fig_cum.update_layout(title='Cumulative Annual Rainfall (and yearly bars)', template=template,
+                              yaxis_title='Cumulative Rainfall (mm)')
+    except Exception as e:
+        fig_cum = go.Figure()
+        fig_cum.add_annotation(text=f"Cumulative plot unavailable: {e}", showarrow=False)
+        fig_cum.update_layout(title='Cumulative Annual Rainfall', template=template)
 
     return {
         'Annual Rainfall Trend': fig_annual,
         'Average Monthly Rainfall': fig_monthly,
         'Climate Change (Rolling Avg)': fig_climate,
         'Rainfall Forecast (Prophet)': fig_forecast,
-        'Rainfall Clusters': fig_cluster
+        'Rainfall Clusters': fig_cluster,
+        'Monthly Distribution (Boxplot)': fig_box,
+        'Cumulative Annual Rainfall': fig_cum
     }
 
 figs_light = build_figures('plotly_white')
@@ -93,7 +151,7 @@ figs_dark = build_figures('plotly_dark')
 # ---------------- Dash App ----------------
 app = Dash(__name__)
 
-# ✅ Updated CSS (dark mode dropdown fix: closed white box, open dark list)
+# ✅ CSS fix for dropdown appearances (both light and dark look)
 app.index_string = '''
 <!DOCTYPE html>
 <html>
@@ -103,9 +161,7 @@ app.index_string = '''
         {%favicon%}
         {%css%}
         <style>
-        /***** Dropdown fix: dark mode closed = white box, open = dark menu *****/
-
-        /* CLOSED dark dropdown (white box, black text) */
+        /* Dropdown theme classes */
         .dropdown-dark .Select-control,
         .dropdown-dark .css-1n8s9fs-control {
             background-color: #ffffff !important;
@@ -113,15 +169,12 @@ app.index_string = '''
             border: 1px solid #334155 !important;
             border-radius: 6px !important;
         }
-
         .dropdown-dark .Select-placeholder,
         .dropdown-dark .Select-value,
         .dropdown-dark .css-1wa3eu0-placeholder,
         .dropdown-dark .css-1uccc91-singleValue {
             color: #0b1220 !important;
         }
-
-        /* When OPENED or FOCUSED -> dark background + white text */
         .dropdown-dark .Select-control.is-open,
         .dropdown-dark .Select-control:focus,
         .dropdown-dark .css-1n8s9fs-control:focus,
@@ -130,14 +183,6 @@ app.index_string = '''
             color: #E2E8F0 !important;
             border-color: #1e293b !important;
         }
-
-        .dropdown-dark .Select-control.is-open .Select-placeholder,
-        .dropdown-dark .Select-control.is-open .Select-value,
-        .dropdown-dark .css-1n8s9fs-control.css-1n8s9fs--is-open .css-1uccc91-singleValue {
-            color: #E2E8F0 !important;
-        }
-
-        /* Menu when open (dark bg + white text) */
         .dropdown-dark .Select-menu-outer,
         .dropdown-dark .css-1n8s9fs-menu,
         .dropdown-dark .Select-option,
@@ -145,14 +190,12 @@ app.index_string = '''
             background-color: #0f172a !important;
             color: #E2E8F0 !important;
         }
-
         .dropdown-dark .Select-option.is-focused,
         .dropdown-dark .css-1n8s9fs-option:hover {
             background-color: #162033 !important;
             color: #ffffff !important;
         }
 
-        /* Light mode dropdowns remain clean white with dark text */
         .dropdown-light .Select-control,
         .dropdown-light .css-1n8s9fs-control {
             background-color: #ffffff !important;
@@ -194,31 +237,30 @@ app.layout = html.Div([
     dcc.Store(id='theme-store', storage_type='local'),
     dcc.Location(id='url', refresh=False),
 
+    # Welcome Screen
     html.Div(id='welcome-screen', children=[
         html.Div([
             html.H1("🌦 Indian Rainfall Analysis Dashboard", id='welcome-title'),
-            html.P("Explore India's rainfall patterns, trends, and forecasts (1901–2015)",
-                   id='welcome-text'),
+            html.P("Explore India's rainfall patterns, trends, and forecasts (1901–2015)", id='welcome-text'),
             html.Button("Start Analysis 🌈", id='start-btn', n_clicks=0,
-                        style={'marginTop': '30px', 'padding': '12px 30px',
-                               'fontSize': '18px', 'background': '#00bcd4',
-                               'color': 'white', 'border': 'none', 'borderRadius': '10px',
-                               'cursor': 'pointer'})
+                        style={'marginTop': '30px', 'padding': '12px 30px', 'fontSize': '18px',
+                               'background': '#00bcd4', 'color': 'white', 'border': 'none',
+                               'borderRadius': '10px', 'cursor': 'pointer'})
         ], style={'textAlign': 'center'})
     ], style={'height': '100vh', 'display': 'flex', 'alignItems': 'center',
               'justifyContent': 'center', 'flexDirection': 'column',
               'background': 'linear-gradient(135deg,#0072ff,#00c6ff)',
               'transition': 'all 0.3s ease'}),
 
+    # Dashboard
     html.Div(id='dashboard-screen', style={'display': 'none', 'transition': 'all 0.3s ease'}, children=[
         html.Div(id='header', style={'display': 'flex', 'justifyContent': 'space-between',
                                      'alignItems': 'center', 'padding': '16px 24px',
                                      'borderRadius': '8px', 'transition': 'all 0.3s ease'}, children=[
-            html.H2("📊 Rainfall Dashboard", id='header-title',
-                    style={'margin': '0', 'transition': 'color 0.3s ease'}),
+            html.H2("📊 Rainfall Dashboard", id='header-title', style={'margin': '0', 'transition': 'color 0.3s ease'}),
             html.Button("🌙", id='theme-toggle', n_clicks=0,
-                        style={'fontSize': '22px', 'background': 'none', 'border': 'none',
-                               'cursor': 'pointer', 'transition': 'all 0.3s ease'})
+                        style={'fontSize': '22px', 'background': 'none', 'border': 'none', 'cursor': 'pointer',
+                               'transition': 'all 0.3s ease'})
         ]),
         html.Div(id='body', style={'padding': '25px', 'minHeight': '100vh',
                                    'transition': 'background 0.3s ease, color 0.3s ease'}, children=[
@@ -235,15 +277,14 @@ app.layout = html.Div([
                     dcc.Dropdown(id='figure-select',
                                  options=[{'label': k, 'value': k} for k in figs_light.keys()],
                                  value='Annual Rainfall Trend', clearable=False,
-                                 style={'width': '300px'},
+                                 style={'width': '320px'},
                                  className='dropdown-light')
                 ])
             ], style={'display': 'flex', 'flexWrap': 'wrap', 'gap': '20px',
                       'alignItems': 'center', 'marginBottom': '15px'}),
 
             html.Div(id='year-row', style={'display': 'none', 'marginBottom': '15px'}, children=[
-                html.Label("Select Year", id='year-label',
-                           style={'marginRight': '10px'}),
+                html.Label("Select Year", id='year-label', style={'marginRight': '10px'}),
                 dcc.Dropdown(id='year-dropdown',
                              options=[{'label': str(y), 'value': y} for y in years],
                              value=years[0], clearable=False, style={'width': '160px'},
@@ -341,4 +382,6 @@ def update_figure(selected, view, year, theme_data):
 # ---------------- Run ----------------
 if __name__ == '__main__':
     print("🚀 Rainfall Dashboard (Final dark mode dropdown fix)")
-    app.run(debug=True, port=8050)
+    # Use PORT env var (Render provides it); fallback to 8050 for local runs
+    port = int(os.environ.get("PORT", 8050))
+    app.run(debug=True, host='0.0.0.0', port=port)
