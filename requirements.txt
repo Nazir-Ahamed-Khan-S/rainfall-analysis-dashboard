@@ -1,7 +1,0 @@
-dash
-plotly
-pandas
-prophet
-scikit-learn
-gunicorn
-openpyxl
