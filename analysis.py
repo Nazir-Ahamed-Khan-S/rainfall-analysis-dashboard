@@ -13,7 +13,7 @@ import sys
 # ---------------- Load Data ----------------
 # Use the script directory so this works locally and on Render
 data_dir = Path(__file__).parent
-candidates = list(data_dir.glob("*.xlsx")) + list(data_dir.glob("*.csv"))
+candidates = sorted(list(data_dir.glob("*.xlsx")) + list(data_dir.glob("*.csv")), key=lambda p: p.stat().st_mtime, reverse=True)
 if not candidates:
     raise FileNotFoundError(f"No rainfall data found in {data_dir}")
 data_file = candidates[0]
@@ -25,9 +25,15 @@ rainfall_data.columns = [c.strip() for c in rainfall_data.columns]
 # Fix columns
 if 'YEAR' not in rainfall_data.columns:
     alt = next((c for c in rainfall_data.columns if 'year' in c.lower()), None)
-    rainfall_data.rename(columns={alt: 'YEAR'}, inplace=True)
+    if alt:
+        rainfall_data.rename(columns={alt: 'YEAR'}, inplace=True)
 if 'ANNUAL' not in rainfall_data.columns:
-    rainfall_data['ANNUAL'] = rainfall_data.select_dtypes('number').sum(axis=1)
+    # sum numeric columns except YEAR (safe fallback)
+    numeric_cols = [c for c in rainfall_data.select_dtypes('number').columns if c.upper() not in ('YEAR',)]
+    if numeric_cols:
+        rainfall_data['ANNUAL'] = rainfall_data[numeric_cols].sum(axis=1)
+    else:
+        rainfall_data['ANNUAL'] = 0
 
 rainfall_data['YEAR'] = pd.to_numeric(rainfall_data['YEAR'], errors='coerce')
 rainfall_data.dropna(subset=['YEAR'], inplace=True)
@@ -57,7 +63,7 @@ def build_figures(template):
     fig_annual.update_layout(title='Annual Rainfall Trend', template=template)
 
     # Average monthly rainfall (bar)
-    monthly_avg = rainfall_data[monthly_columns].mean()
+    monthly_avg = rainfall_data[monthly_columns].mean() if monthly_columns else pd.Series([0]*len(monthly_display))
     fig_monthly = px.bar(x=monthly_display, y=monthly_avg.values,
                          labels={'x': 'Month', 'y': 'Rainfall (mm)'},
                          title='Average Monthly Rainfall',
@@ -73,10 +79,10 @@ def build_figures(template):
     fig_climate.update_layout(title='Climate Change Impact (10-Year Rolling Avg)', template=template)
 
     # Prophet forecast
-    rainfall_data['DATE'] = pd.to_datetime(rainfall_data['YEAR'], format='%Y')
-    prophet_data = rainfall_data[['DATE', 'ANNUAL']].rename(columns={'DATE': 'ds', 'ANNUAL': 'y'})
-    model = Prophet()
     try:
+        rainfall_data['DATE'] = pd.to_datetime(rainfall_data['YEAR'], format='%Y')
+        prophet_data = rainfall_data[['DATE', 'ANNUAL']].rename(columns={'DATE': 'ds', 'ANNUAL': 'y'})
+        model = Prophet()
         model.fit(prophet_data)
         future = model.make_future_dataframe(periods=20, freq='Y')
         forecast = model.predict(future)
@@ -89,14 +95,12 @@ def build_figures(template):
         fig_forecast.update_layout(title='Rainfall Forecast (Prophet)', template=template)
 
     # Clustering (KMeans)
-    features = rainfall_data[monthly_columns + ['ANNUAL']].fillna(0)
+    features = rainfall_data[monthly_columns + ['ANNUAL']].fillna(0) if monthly_columns else rainfall_data[['ANNUAL']].fillna(0)
     try:
         scaled = StandardScaler().fit_transform(features)
         kmeans = KMeans(n_clusters=3, random_state=42)
         rainfall_data['Cluster'] = kmeans.fit_predict(scaled)
         labels = {0: 'Dry', 1: 'Normal', 2: 'Wet'}
-        # If cluster labels not 0/1/2 in order, map by cluster center mean
-        # But keep simple mapping as above
         rainfall_data['Category'] = rainfall_data['Cluster'].map(labels)
         fig_cluster = px.scatter(rainfall_data, x='YEAR', y='ANNUAL', color='Category',
                                  title='Rainfall Clustering (Dry / Normal / Wet)', template=template)
@@ -105,13 +109,10 @@ def build_figures(template):
         fig_cluster.add_annotation(text=f"Clustering unavailable: {e}", showarrow=False)
         fig_cluster.update_layout(title='Rainfall Clustering', template=template)
 
-    # --- New Visualization 1: Monthly Boxplot (distribution across years)
+    # --- Monthly Boxplot (distribution across years)
     try:
-        # prepare long format for months
         df_melt = rainfall_data[['YEAR'] + monthly_columns].melt(id_vars='YEAR', var_name='Month', value_name='Rainfall')
-        # order months according to monthly_columns
         month_order = monthly_columns
-        # map to display names if necessary
         fig_box = px.box(df_melt, x='Month', y='Rainfall', category_orders={'Month': month_order},
                          labels={'Month': 'Month', 'Rainfall': 'Rainfall (mm)'},
                          title='Monthly Rainfall Distribution (boxplot)', template=template)
@@ -120,7 +121,7 @@ def build_figures(template):
         fig_box.add_annotation(text=f"Boxplot unavailable: {e}", showarrow=False)
         fig_box.update_layout(title='Monthly Rainfall Distribution', template=template)
 
-    # --- New Visualization 2: Cumulative Annual Rainfall
+    # --- Cumulative Annual Rainfall
     try:
         cum = annual.copy()
         cum['CUM_SUM'] = cum['ANNUAL'].cumsum()
@@ -334,6 +335,7 @@ def toggle_theme(n_clicks, data):
     theme = data.get('theme', 'light') if data else 'light'
     if n_clicks:
         theme = 'dark' if theme == 'light' else 'light'
+    # show a sun icon when currently dark (to indicate clicking will switch to light), otherwise moon
     return {'theme': theme}, ('☀️' if theme == 'dark' else '🌙')
 
 @app.callback(
@@ -365,18 +367,89 @@ def update_figure(selected, view, year, theme_data):
 
     dropdown_class = 'dropdown-dark' if dark else 'dropdown-light'
 
+    # ALL YEARS: simple — return the chosen saved figure
     if view == 'all':
         return figs[selected], header_style, body_style, text_style, dropdown_class, dropdown_class
 
+    # SINGLE YEAR: produce a figure appropriate for the selected visualization
+    # Find the row for the selected year (safe fallback to first row)
     row = rainfall_data[rainfall_data['YEAR'] == year]
     if row.empty:
         row = rainfall_data.iloc[[0]]
+        year = int(row.iloc[0]['YEAR'])
     yd = row.iloc[0]
-    vals = [float(yd.get(m, 0)) for m in monthly_columns]
-    fig = px.bar(x=monthly_display, y=vals,
-                 labels={'x': 'Month', 'y': 'Rainfall (mm)'},
-                 title=f'Monthly Rainfall - {year}',
-                 color=vals, color_continuous_scale='Blues', template=template)
+
+    # Case A: Monthly-specific visualizations -> show that year's monthly bars / overlay on boxplot
+    if selected == 'Average Monthly Rainfall':
+        vals = [float(yd.get(m, 0)) for m in monthly_columns] if monthly_columns else [0] * len(monthly_display)
+        fig = px.bar(x=monthly_display, y=vals,
+                     labels={'x': 'Month', 'y': 'Rainfall (mm)'},
+                     title=f'Average Monthly Rainfall — {year}',
+                     color=vals, color_continuous_scale='Blues', template=template)
+        return fig, header_style, body_style, text_style, dropdown_class, dropdown_class
+
+    if selected == 'Monthly Distribution (Boxplot)':
+        # base boxplot across years, then overlay this year's monthly points
+        try:
+            df_melt = rainfall_data[['YEAR'] + monthly_columns].melt(id_vars='YEAR', var_name='Month', value_name='Rainfall')
+            month_order = monthly_columns
+            fig = px.box(df_melt, x='Month', y='Rainfall', category_orders={'Month': month_order},
+                         labels={'Month': 'Month', 'Rainfall': 'Rainfall (mm)'},
+                         title=f'Monthly Rainfall Distribution (with {year} overlaid)', template=template)
+            # overlay the selected year's monthly points
+            vals = [float(yd.get(m, None) or 0) for m in monthly_columns]
+            fig.add_trace(go.Scatter(x=monthly_columns, y=vals, mode='markers+lines', name=str(year),
+                                     marker=dict(size=10, symbol='diamond'), hoverinfo='y'))
+            # if display names differ, update x-axis ticktext
+            fig.update_layout(xaxis={'tickmode':'array', 'tickvals': monthly_columns, 'ticktext': monthly_display})
+        except Exception as e:
+            fig = go.Figure()
+            fig.add_annotation(text=f"Boxplot unavailable: {e}", showarrow=False)
+            fig.update_layout(title='Monthly Rainfall Distribution', template=template)
+        return fig, header_style, body_style, text_style, dropdown_class, dropdown_class
+
+    # Case B: Year-series visualizations -> take the saved figure and highlight the year
+    base_fig = figs.get(selected, None)
+    if base_fig is None:
+        # fallback: show simple monthly bar for year
+        vals = [float(yd.get(m, 0)) for m in monthly_columns] if monthly_columns else [0] * len(monthly_display)
+        fig = px.bar(x=monthly_display, y=vals, labels={'x': 'Month', 'y': 'Rainfall (mm)'},
+                     title=f'{selected} — {year}', color=vals, color_continuous_scale='Blues', template=template)
+        return fig, header_style, body_style, text_style, dropdown_class, dropdown_class
+
+    # copy figure so we don't mutate cached figs
+    fig = go.Figure(base_fig)
+
+    # add vertical highlight line at the selected year (when x axis is YEAR)
+    try:
+        fig.add_vline(x=year, line_width=2, line_dash="dash", line_color="crimson", opacity=0.9)
+    except Exception:
+        # not all figures have numeric-year x-axis — ignore errors silently
+        pass
+
+    # add annotation for the year with the annual value if available
+    annual_val = None
+    try:
+        annual_val = float(yd.get('ANNUAL', None) or 0)
+        fig.add_annotation(x=year, y=annual_val,
+                           text=f"{year}: {annual_val:.1f}",
+                           showarrow=True, arrowhead=2, ax=0, ay=-40,
+                           bgcolor="rgba(255,255,255,0.8)" if not dark else "rgba(11,17,32,0.85)")
+    except Exception:
+        # ignore if annual not applicable for this visualization
+        pass
+
+    # For clustering or scatter-like plots, also add a highlighted marker for the year
+    try:
+        if 'Cluster' in rainfall_data.columns and annual_val is not None:
+            fig.add_trace(go.Scatter(x=[year], y=[annual_val], mode='markers', marker=dict(size=12, color='crimson'),
+                                     name=f"Selected {year}", hoverinfo='y'))
+    except Exception:
+        pass
+
+    # Ensure template is consistent with theme
+    fig.update_layout(template=template, title=f"{selected} — highlighted {year}")
+
     return fig, header_style, body_style, text_style, dropdown_class, dropdown_class
 
 # ---------------- Run ----------------
@@ -384,4 +457,6 @@ if __name__ == '__main__':
     print("🚀 Rainfall Dashboard (Final dark mode dropdown fix)")
     # Use PORT env var (Render provides it); fallback to 8050 for local runs
     port = int(os.environ.get("PORT", 8050))
-    app.run(debug=True, host='0.0.0.0', port=port)
+    # BIND TO LOOPBACK (127.0.0.1) so console shows http://127.0.0.1:8050/ and the app is only reachable locally.
+    app.run(debug=True, host='127.0.0.1', port=port)
+#done
