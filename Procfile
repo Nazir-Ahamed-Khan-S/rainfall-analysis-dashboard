@@ -1,1 +1,1 @@
-﻿web: gunicorn analysis:app.server
+﻿web: gunicorn notebooks.analysis:app.server
