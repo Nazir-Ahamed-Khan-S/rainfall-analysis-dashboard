@@ -1,8 +1,6 @@
-dash
-plotly
 pandas
-prophet
+plotly
 scikit-learn
-matplotlib
+prophet
+dash
 gunicorn
-openpyxl
